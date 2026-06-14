@@ -1,0 +1,263 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jordan Olivet <jordanolivet@gmail.com>
+Date: Sun, 14 Jun 2026 22:47:25 +0200
+Subject: [PATCH] fix: guard off-thread block-entity access during light
+ propagation
+
+Light propagation runs on scalablelux-* worker threads. Block occlusion
+shape, light-block opacity and light-emission lookups passed the real
+Level to block methods; a block (e.g. TreeChop's ChoppedLogBlock) could
+then call getBlockEntity() and force-load a neighbour chunk off the main
+thread, throwing "Should always be able to create a chunk!" which wedges
+shutdown and freezes the JVM.
+
+Route those queries through a new LightSafeBlockGetter backed by the
+non-forcing lighting chunk view (LightChunkGetter#getChunkForLighting),
+returning null/air when a chunk is not loaded for lighting instead of
+force-creating it off-thread. Cached per lightAccess on the engine.
+
+diff --git a/src/main/java/ca/spottedleaf/starlight/common/light/BlockStarLightEngine.java b/src/main/java/ca/spottedleaf/starlight/common/light/BlockStarLightEngine.java
+index 3c7d4d3..bb62ae6 100644
+--- a/src/main/java/ca/spottedleaf/starlight/common/light/BlockStarLightEngine.java
++++ b/src/main/java/ca/spottedleaf/starlight/common/light/BlockStarLightEngine.java
+@@ -3,6 +3,7 @@ package ca.spottedleaf.starlight.common.light;
+ import ca.spottedleaf.starlight.common.blockstate.ExtendedAbstractBlockState;
+ import ca.spottedleaf.starlight.common.chunk.ExtendedChunk;
+ import net.minecraft.core.BlockPos;
++import net.minecraft.world.level.BlockGetter;
+ import net.minecraft.world.level.Level;
+ import net.minecraft.world.level.block.state.BlockState;
+ import net.minecraft.world.level.chunk.ChunkAccess;
+@@ -96,7 +97,7 @@ public final class BlockStarLightEngine extends StarLightEngine {
+         final int currentLevel = this.getLightLevel(worldX, worldY, worldZ);
+         final BlockState blockState = this.getBlockState(worldX, worldY, worldZ);
+         this.checkBlockPos.set(worldX, worldY, worldZ);
+-        final int emittedLevel = blockState.getLightEmission(lightAccess.getLevel(), this.checkBlockPos) & emittedMask;
++        final int emittedLevel = blockState.getLightEmission(this.getLightReader(lightAccess), this.checkBlockPos) & emittedMask;
+ 
+         this.setLightLevel(worldX, worldY, worldZ, emittedLevel);
+         // this accounts for change in emitted light that would cause an increase
+@@ -131,7 +132,7 @@ public final class BlockStarLightEngine extends StarLightEngine {
+                                       final int expect) {
+         final BlockState centerState = this.getBlockState(worldX, worldY, worldZ);
+         this.recalcCenterPos.set(worldX, worldY, worldZ);
+-        int level = centerState.getLightEmission(lightAccess.getLevel(), this.recalcCenterPos) & 0xF;
++        int level = centerState.getLightEmission(this.getLightReader(lightAccess), this.recalcCenterPos) & 0xF;
+ 
+         if (level >= (15 - 1) || level > expect) {
+             return level;
+@@ -142,7 +143,7 @@ public final class BlockStarLightEngine extends StarLightEngine {
+         int opacity = ((ExtendedAbstractBlockState)centerState).getOpacityIfCached();
+ 
+         if (opacity == -1) {
+-            opacity = centerState.getLightBlock(lightAccess.getLevel(), this.recalcCenterPos);
++            opacity = centerState.getLightBlock(this.getLightReader(lightAccess), this.recalcCenterPos);
+             if (((ExtendedAbstractBlockState)centerState).isConditionallyFullOpaque()) {
+                 conditionallyOpaqueState = centerState;
+             } else {
+@@ -175,8 +176,9 @@ public final class BlockStarLightEngine extends StarLightEngine {
+                 // we don't read the blockstate because most of the time this is false, so using the faster
+                 // known transparency lookup results in a net win
+                 this.recalcNeighbourPos.set(offX, offY, offZ);
+-                final VoxelShape neighbourFace = neighbourState.getFaceOcclusionShape(lightAccess.getLevel(), this.recalcNeighbourPos, direction.opposite.nms);
+-                final VoxelShape thisFace = conditionallyOpaqueState == null ? Shapes.empty() : conditionallyOpaqueState.getFaceOcclusionShape(lightAccess.getLevel(), this.recalcCenterPos, direction.nms);
++                final BlockGetter world = this.getLightReader(lightAccess);
++                final VoxelShape neighbourFace = neighbourState.getFaceOcclusionShape(world, this.recalcNeighbourPos, direction.opposite.nms);
++                final VoxelShape thisFace = conditionallyOpaqueState == null ? Shapes.empty() : conditionallyOpaqueState.getFaceOcclusionShape(world, this.recalcCenterPos, direction.nms);
+                 if (Shapes.faceShapeOccludes(thisFace, neighbourFace)) {
+                     // not allowed to propagate
+                     continue;
+@@ -227,7 +229,7 @@ public final class BlockStarLightEngine extends StarLightEngine {
+             for (int index = 0; index < (16 * 16 * 16); ++index) {
+                 final BlockState state = states.get(index);
+                 this.mutablePos4.set(offX | (index & 15), offY | (index >>> 8), offZ | ((index >>> 4) & 15));
+-                if (state.getLightEmission(lightAccess.getLevel(), this.mutablePos1) <= 0) {
++                if (state.getLightEmission(this.getLightReader(lightAccess), this.mutablePos1) <= 0) {
+                     continue;
+                 }
+ 
+@@ -247,7 +249,7 @@ public final class BlockStarLightEngine extends StarLightEngine {
+         for (int i = 0, len = positions.size(); i < len; ++i) {
+             final BlockPos pos = positions.get(i);
+             final BlockState blockState = this.getBlockState(pos.getX(), pos.getY(), pos.getZ());
+-            final int emittedLight = blockState.getLightEmission(lightAccess.getLevel(), pos) & emittedMask;
++            final int emittedLight = blockState.getLightEmission(this.getLightReader(lightAccess), pos) & emittedMask;
+ 
+             if (emittedLight <= this.getLightLevel(pos.getX(), pos.getY(), pos.getZ())) {
+                 // some other source is brighter
+diff --git a/src/main/java/ca/spottedleaf/starlight/common/light/LightSafeBlockGetter.java b/src/main/java/ca/spottedleaf/starlight/common/light/LightSafeBlockGetter.java
+new file mode 100644
+index 0000000..d593a33
+--- /dev/null
++++ b/src/main/java/ca/spottedleaf/starlight/common/light/LightSafeBlockGetter.java
+@@ -0,0 +1,72 @@
++package ca.spottedleaf.starlight.common.light;
++
++import net.minecraft.core.BlockPos;
++import net.minecraft.world.level.BlockGetter;
++import net.minecraft.world.level.LevelHeightAccessor;
++import net.minecraft.world.level.block.Blocks;
++import net.minecraft.world.level.block.entity.BlockEntity;
++import net.minecraft.world.level.block.state.BlockState;
++import net.minecraft.world.level.chunk.ChunkAccess;
++import net.minecraft.world.level.chunk.LightChunkGetter;
++import net.minecraft.world.level.material.FluidState;
++
++/**
++ * A {@link BlockGetter} that exposes block data strictly through the lighting chunk view
++ * ({@link LightChunkGetter#getChunkForLighting}), which never forces a chunk to load.
++ * <p>
++ * Light propagation runs off the main thread on {@code scalablelux-*} worker threads. While
++ * computing a block's occlusion shape, light opacity or light emission, vanilla and especially
++ * modded blocks (e.g. TreeChop's {@code ChoppedLogBlock}) may call {@code getBlockEntity(pos)}
++ * on the level. If that position lives in a neighbour chunk that is present in the light cache
++ * but not fully loaded in the world, {@code Level#getBlockEntity} force-loads the chunk off the
++ * main thread and the server throws {@code IllegalStateException: Should always be able to
++ * create a chunk!}, which then wedges shutdown and freezes the JVM.
++ * <p>
++ * Routing those queries through the lighting view returns the already-available chunk data, or
++ * {@code null}/air when the chunk is not loaded for lighting, so the shape/light computation
++ * degrades gracefully instead of crashing the light worker. This mirrors the safe fallback that
++ * {@link StarLightEngine#getBlockState(int, int, int)} already provides for its internal reads.
++ */
++public final class LightSafeBlockGetter implements BlockGetter {
++
++    private final LightChunkGetter lightAccess;
++    private final LevelHeightAccessor heightAccessor;
++
++    public LightSafeBlockGetter(final LightChunkGetter lightAccess, final LevelHeightAccessor heightAccessor) {
++        this.lightAccess = lightAccess;
++        this.heightAccessor = heightAccessor;
++    }
++
++    private ChunkAccess getChunkForLighting(final int blockX, final int blockZ) {
++        // Same non-forcing lookup the light engine itself uses; returns null when the chunk
++        // is not available for lighting instead of force-creating it off-thread.
++        return (ChunkAccess) this.lightAccess.getChunkForLighting(blockX >> 4, blockZ >> 4);
++    }
++
++    @Override
++    public BlockEntity getBlockEntity(final BlockPos pos) {
++        final ChunkAccess chunk = this.getChunkForLighting(pos.getX(), pos.getZ());
++        return chunk == null ? null : chunk.getBlockEntity(pos);
++    }
++
++    @Override
++    public BlockState getBlockState(final BlockPos pos) {
++        final ChunkAccess chunk = this.getChunkForLighting(pos.getX(), pos.getZ());
++        return chunk == null ? Blocks.AIR.defaultBlockState() : chunk.getBlockState(pos);
++    }
++
++    @Override
++    public FluidState getFluidState(final BlockPos pos) {
++        return this.getBlockState(pos).getFluidState();
++    }
++
++    @Override
++    public int getHeight() {
++        return this.heightAccessor.getHeight();
++    }
++
++    @Override
++    public int getMinBuildHeight() {
++        return this.heightAccessor.getMinBuildHeight();
++    }
++}
+diff --git a/src/main/java/ca/spottedleaf/starlight/common/light/SkyStarLightEngine.java b/src/main/java/ca/spottedleaf/starlight/common/light/SkyStarLightEngine.java
+index 1d71091..f9bbfa3 100644
+--- a/src/main/java/ca/spottedleaf/starlight/common/light/SkyStarLightEngine.java
++++ b/src/main/java/ca/spottedleaf/starlight/common/light/SkyStarLightEngine.java
+@@ -307,7 +307,7 @@ public final class SkyStarLightEngine extends StarLightEngine {
+         final BlockState conditionallyOpaqueState;
+         if (opacity < 0) {
+             this.recalcCenterPos.set(worldX, worldY, worldZ);
+-            opacity = Math.max(1, centerState.getLightBlock(lightAccess.getLevel(), this.recalcCenterPos));
++            opacity = Math.max(1, centerState.getLightBlock(this.getLightReader(lightAccess), this.recalcCenterPos));
+             if (((ExtendedAbstractBlockState)centerState).isConditionallyFullOpaque()) {
+                 conditionallyOpaqueState = centerState;
+             } else {
+@@ -341,8 +341,9 @@ public final class SkyStarLightEngine extends StarLightEngine {
+                 // we don't read the blockstate because most of the time this is false, so using the faster
+                 // known transparency lookup results in a net win
+                 this.recalcNeighbourPos.set(offX, offY, offZ);
+-                final VoxelShape neighbourFace = neighbourState.getFaceOcclusionShape(lightAccess.getLevel(), this.recalcNeighbourPos, direction.opposite.nms);
+-                final VoxelShape thisFace = conditionallyOpaqueState == null ? Shapes.empty() : conditionallyOpaqueState.getFaceOcclusionShape(lightAccess.getLevel(), this.recalcCenterPos, direction.nms);
++                final BlockGetter world = this.getLightReader(lightAccess);
++                final VoxelShape neighbourFace = neighbourState.getFaceOcclusionShape(world, this.recalcNeighbourPos, direction.opposite.nms);
++                final VoxelShape thisFace = conditionallyOpaqueState == null ? Shapes.empty() : conditionallyOpaqueState.getFaceOcclusionShape(world, this.recalcCenterPos, direction.nms);
+                 if (Shapes.faceShapeOccludes(thisFace, neighbourFace)) {
+                     // not allowed to propagate
+                     continue;
+@@ -364,7 +365,7 @@ public final class SkyStarLightEngine extends StarLightEngine {
+         this.rewriteNibbleCacheForSkylight(atChunk);
+         Arrays.fill(this.nullPropagationCheckCache, false);
+ 
+-        final BlockGetter world = lightAccess.getLevel();
++        final BlockGetter world = this.getLightReader(lightAccess);
+         final int chunkX = atChunk.getPos().x;
+         final int chunkZ = atChunk.getPos().z;
+         final int heightMapOffset = chunkX * -16 + (chunkZ * (-16 * 16));
+@@ -458,7 +459,7 @@ public final class SkyStarLightEngine extends StarLightEngine {
+         this.rewriteNibbleCacheForSkylight(chunk);
+         Arrays.fill(this.nullPropagationCheckCache, false);
+ 
+-        final BlockGetter world = lightAccess.getLevel();
++        final BlockGetter world = this.getLightReader(lightAccess);
+         final ChunkPos chunkPos = chunk.getPos();
+         final int chunkX = chunkPos.x;
+         final int chunkZ = chunkPos.z;
+diff --git a/src/main/java/ca/spottedleaf/starlight/common/light/StarLightEngine.java b/src/main/java/ca/spottedleaf/starlight/common/light/StarLightEngine.java
+index 85961f1..8923082 100644
+--- a/src/main/java/ca/spottedleaf/starlight/common/light/StarLightEngine.java
++++ b/src/main/java/ca/spottedleaf/starlight/common/light/StarLightEngine.java
+@@ -134,6 +134,14 @@ public abstract class StarLightEngine {
+     protected final int minSection;
+     protected final int maxSection;
+ 
++    // A BlockGetter that reads through the (non-forcing) lighting chunk view, used whenever we
++    // hand a level to a block method (occlusion shape / light block / light emission). Without it,
++    // a block querying getBlockEntity() off-thread can force-load a neighbour chunk and crash the
++    // light worker with "Should always be able to create a chunk!". Cached per lightAccess; an
++    // engine instance only processes one task (one thread) at a time, so no synchronisation needed.
++    private LightChunkGetter lightReaderAccess;
++    private LightSafeBlockGetter lightReader;
++
+     protected StarLightEngine(final boolean skylightPropagator, final Level world) {
+         this.skylightPropagator = skylightPropagator;
+         this.emittedLightMask = skylightPropagator ? 0 : 0xF;
+@@ -282,6 +290,17 @@ public abstract class StarLightEngine {
+         }
+     }
+ 
++    // Returns a non-forcing BlockGetter view for the given lightAccess, to be passed to any block
++    // method that takes a level (getFaceOcclusionShape / getLightBlock / getLightEmission). See
++    // LightSafeBlockGetter for why this is required to avoid off-thread chunk loads.
++    protected final BlockGetter getLightReader(final LightChunkGetter lightAccess) {
++        if (lightAccess != this.lightReaderAccess) {
++            this.lightReader = new LightSafeBlockGetter(lightAccess, this.world);
++            this.lightReaderAccess = lightAccess;
++        }
++        return this.lightReader;
++    }
++
+     protected final BlockState getBlockState(final int worldX, final int worldY, final int worldZ) {
+         final LevelChunkSection section = this.sectionCache[(worldX >> 4) + 5 * (worldZ >> 4) + (5 * 5) * (worldY >> 4) + this.chunkSectionIndexOffset];
+ 
+@@ -1103,7 +1122,7 @@ public abstract class StarLightEngine {
+     }
+ 
+     protected final void performLightIncrease(final LightChunkGetter lightAccess) {
+-        final BlockGetter world = lightAccess.getLevel();
++        final BlockGetter world = this.getLightReader(lightAccess);
+         long[] queue = this.increaseQueue;
+         int queueReadIndex = 0;
+         int queueLength = this.increaseQueueInitialLength;
+@@ -1293,7 +1312,7 @@ public abstract class StarLightEngine {
+     }
+ 
+     protected final void performLightDecrease(final LightChunkGetter lightAccess) {
+-        final BlockGetter world = lightAccess.getLevel();
++        final BlockGetter world = this.getLightReader(lightAccess);
+         long[] queue = this.decreaseQueue;
+         long[] increaseQueue = this.increaseQueue;
+         int queueReadIndex = 0;
